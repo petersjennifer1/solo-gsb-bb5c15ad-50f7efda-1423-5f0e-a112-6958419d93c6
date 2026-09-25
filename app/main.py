@@ -11,6 +11,7 @@ POST /plans/{plan_id}/glaze-separation   釉色隔离：提交互斥对，只读
 POST /plans/{plan_id}/kilns/{index}/temperature-check
                                            窑次温控核验：求落在合格温区内的最长连续时段
 POST /plans/{plan_id}/firing-order       单台实体窑点火排程：全部批次不逾期的最早整体完工
+POST /plans/{plan_id}/cost-allocation     烧成费用分摊：各窑按体积比例精确分摊、取整补齐
 GET  /health                             健康检查
 """
 
@@ -23,6 +24,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from . import database
+from .costallocation import allocate_plan_cost
 from .firing import (
     FiringBatch,
     NoFeasibleFiringOrderError,
@@ -34,6 +36,10 @@ from .schemas import (
     CancelItemsOut,
     CapacityTargetIn,
     CapacityTargetOut,
+    CostAllocationIn,
+    CostAllocationOut,
+    CostAllocationKilnOut,
+    CostItemOut,
     ErrorOut,
     FiringBatchOut,
     FiringOrderIn,
@@ -787,4 +793,162 @@ def firing_order(plan_id: str, payload: FiringOrderIn) -> FiringOrderOut:
         makespan_minute=schedule.makespan,
         order=[b.kiln_index for b in schedule.batches],
         batches=batches_out,
+    )
+
+
+@app.post(
+    "/plans/{plan_id}/cost-allocation",
+    response_model=CostAllocationOut,
+    tags=["plans"],
+    responses={
+        400: {
+            "model": ErrorOut,
+            "description": "窑次 / 器物未完整覆盖 / 窑费用超过该窑上限总和",
+        },
+        404: {"model": ErrorOut, "description": "方案不存在"},
+    },
+    summary="烧成费用分摊：各窑按体积比例精确分摊、取整补齐",
+)
+def cost_allocation(plan_id: str, payload: CostAllocationIn) -> CostAllocationOut:
+    plan = database.get_plan(plan_id)
+    if plan is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": "PLAN_NOT_FOUND",
+                "message": f"未找到排程方案: {plan_id}",
+            },
+        )
+
+    kiln_count = plan["kiln_count"]
+    kilns_sorted = sorted(plan["kilns"], key=lambda k: k["index"])
+    by_id = {it["item_id"]: it for it in plan["items"]}
+
+    # ---- 1. 窑次费用必须完整覆盖全部窑次（每个窑次恰好一条） ----
+    unknown_kilns = sorted(
+        i for i in payload.kiln_costs if not 1 <= i <= kiln_count
+    )
+    if unknown_kilns:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "UNKNOWN_KILN_INDEX",
+                "message": (
+                    f"方案 {plan_id} 共 {kiln_count} 个窑次，窑次序号须为 "
+                    f"1～{kiln_count}: {', '.join(str(i) for i in unknown_kilns)}"
+                ),
+            },
+        )
+    missing_kilns = sorted(
+        set(range(1, kiln_count + 1)) - set(payload.kiln_costs)
+    )
+    if missing_kilns:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "MISSING_KILN_COST",
+                "message": (
+                    f"必须恰好覆盖全部 {kiln_count} 个窑次的费用，缺少窑次: "
+                    + ", ".join(str(i) for i in missing_kilns)
+                ),
+            },
+        )
+
+    # ---- 2. 器物收费上限必须完整覆盖全部器物（每件恰好一条） ----
+    original_ids = set(by_id)
+    unknown_items = sorted(set(payload.item_caps) - original_ids)
+    if unknown_items:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "UNKNOWN_ITEM_ID",
+                "message": f"以下器物编号不属于原方案: {', '.join(unknown_items)}",
+            },
+        )
+    missing_items = sorted(original_ids - set(payload.item_caps))
+    if missing_items:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "MISSING_ITEM_CAP",
+                "message": (
+                    "必须为全部器物提供收费上限，缺少器物: "
+                    + ", ".join(missing_items)
+                ),
+            },
+        )
+
+    # ---- 3. 各窑独立判定费用是否超过该窑器物上限总和（明确报错） ----
+    insufficient: list[str] = []
+    for kiln in kilns_sorted:
+        cap_sum = sum(payload.item_caps[i] for i in kiln["item_ids"])
+        cost = payload.kiln_costs[kiln["index"]]
+        if cost > cap_sum:
+            insufficient.append(
+                f"窑次 {kiln['index']} 费用 {cost} 分 > 上限总和 {cap_sum} 分"
+                f"（缺 {cost - cap_sum} 分）"
+            )
+    if insufficient:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "KILN_CAP_INSUFFICIENT",
+                "message": (
+                    "以下窑次的烧成费用超过该窑器物收费上限总和: "
+                    + "；".join(insufficient)
+                ),
+            },
+        )
+
+    # ---- 4. 各窑独立按体积比例精确分摊（只读计算，不改写原方案） ----
+    allocation = allocate_plan_cost(
+        [
+            (
+                kiln["index"],
+                [(i, by_id[i]["volume"]) for i in kiln["item_ids"]],
+            )
+            for kiln in kilns_sorted
+        ],
+        payload.item_caps,
+        payload.kiln_costs,
+    )
+
+    kilns_out: list[CostAllocationKilnOut] = []
+    items_out: list[CostItemOut] = []
+    for result in allocation.kilns:
+        kiln_items = [
+            CostItemOut(
+                item_id=it.item_id,
+                kiln_index=it.kiln_index,
+                volume=it.volume,
+                cap_fen=it.cap_fen,
+                exact_share_fen=format_fraction(it.exact_share),
+                allocated_fen=it.allocated_fen,
+            )
+            for it in result.items
+        ]
+        items_out.extend(kiln_items)
+        kilns_out.append(
+            CostAllocationKilnOut(
+                kiln_index=result.kiln_index,
+                cost_fen=result.cost_fen,
+                cap_sum_fen=result.cap_sum_fen,
+                lambda_value=format_fraction(result.lambda_value),
+                items=kiln_items,
+                allocated_total_fen=result.allocated_total_fen,
+            )
+        )
+
+    items_out.sort(key=lambda it: it.item_id)
+    total_cost = sum(k.cost_fen for k in allocation.kilns)
+    total_allocated = sum(k.allocated_total_fen for k in allocation.kilns)
+    assert total_allocated == total_cost
+
+    return CostAllocationOut(
+        plan_id=plan["id"],
+        total_cost_fen=total_cost,
+        total_allocated_fen=total_allocated,
+        total_cap_sum_fen=allocation.total_cap_sum_fen,
+        items=items_out,
+        kilns=kilns_out,
     )

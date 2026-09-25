@@ -8,7 +8,8 @@
 （提交器物互斥对，只读重求最少窑次建议）、两版方案差异对比、
 **窑次温控核验**（按分段线性插值精确求落在该窑合格温区内的最长连续时段），
 以及**单台实体窑点火排程**（按每批最早可点火 / 烧成时长 / 最迟完成分钟，
-求全部批次均不逾期时的最早整体完工）。
+求全部批次均不逾期时的最早整体完工），以及**烧成费用分摊**（按窑次给出费用、
+按器物给出收费上限，各窑独立按器物体积比例以精确有理数分摊并取整补齐）。
 
 技术栈：Python 3.12 · FastAPI · SQLite · Uvicorn。
 
@@ -673,6 +674,91 @@ curl -s -X POST http://localhost:8000/plans/9c05e113e3e0430eb552a0bd01036dbb/fir
 - `404` `PLAN_NOT_FOUND`：方案不存在；
 - `422`：请求参数非法（窑次序号重复 / 分钟为负 / 时长非正 / 缺少字段等）。
 
+### 11. 烧成费用分摊（各窑按体积比例精确分摊、取整补齐）
+
+`POST http://localhost:8000/plans/{id}/cost-allocation`
+
+针对**已保存**的方案，把每窑的烧成费用分摊到该窑各件器物上：
+
+- 请求按**窑次序号**给出每窑烧成费用（分，非负整数），按**器物编号**给出
+  每件的收费上限（分，非负整数）；两组都必须**完整覆盖**原方案
+  （每个窑次恰好一条费用、每件器物恰好一条上限，不多不少）；
+- **各窑独立分摊**：器物份额为 `min(收费上限, λ × 体积)`，其中 λ 用
+  **精确有理数**（`Fraction`）求解，使该窑各器物份额之和**恰等于**
+  该窑费用；某窑费用超过该窑器物收费上限总和时返回明确错误
+  （`KILN_CAP_INSUFFICIENT`，响应体列出全部超限窑次与缺口）；
+- **取整补齐**：各器物精确份额**向下取整**为整数分，取整产生的剩余分按
+  **小数余数降序、器物编号升序**逐件补 1 分，直至分完；
+- 返回每件器物费用、各窑合计与方案总额，**分摊结果总额与请求总额一致**；
+  **只读计算，不改写原方案。**
+
+请求体（必须**恰好覆盖全部窑次与全部器物**）：
+
+```json
+{
+  "kiln_costs": {"1": 100, "2": 200, "3": 50},
+  "item_caps": {"p1": 200, "p2": 300, "p3": 300, "p4": 50}
+}
+```
+
+字段约束：`kiln_costs` 的键为全部窑次序号（`1～窑次数`），值为非负整数；
+`item_caps` 的键为全部器物编号（非空白字符串），值为非负整数；金额单位均为**分**。
+
+curl 示例（沿用第 1 节方案，共 3 个窑次、4 件器物）：
+
+```bash
+curl -s -X POST http://localhost:8000/plans/9c05e113e3e0430eb552a0bd01036dbb/cost-allocation \
+  -H 'Content-Type: application/json' \
+  -d '{"kiln_costs": {"1": 100, "2": 200, "3": 50}, "item_caps": {"p1": 200, "p2": 300, "p3": 300, "p4": 50}}'
+```
+
+成功响应 `200 OK`（各器物含精确份额 `exact_share_fen` 与取整后的
+`allocated_fen`，各窑含精确比例系数 `lambda_value`，均为约分分数 `p/q`）：
+
+```json
+{
+  "plan_id": "9c05e113e3e0430eb552a0bd01036dbb",
+  "total_cost_fen": 350,
+  "total_allocated_fen": 350,
+  "total_cap_sum_fen": 850,
+  "items": [
+    {"item_id": "p1", "kiln_index": 1, "volume": 5, "cap_fen": 200, "exact_share_fen": "100/1", "allocated_fen": 100},
+    {"item_id": "p2", "kiln_index": 2, "volume": 6, "cap_fen": 300, "exact_share_fen": "120/1", "allocated_fen": 120},
+    {"item_id": "p3", "kiln_index": 2, "volume": 4, "cap_fen": 300, "exact_share_fen": "80/1",  "allocated_fen": 80},
+    {"item_id": "p4", "kiln_index": 3, "volume": 5, "cap_fen": 50,  "exact_share_fen": "50/1",  "allocated_fen": 50}
+  ],
+  "kilns": [
+    {"kiln_index": 1, "cost_fen": 100, "cap_sum_fen": 200, "lambda_value": "20/1",  "allocated_total_fen": 100, "items": [ ... 本窑器物 ... ]},
+    {"kiln_index": 2, "cost_fen": 200, "cap_sum_fen": 600, "lambda_value": "20/1",  "allocated_total_fen": 200, "items": [ ... 本窑器物 ... ]},
+    {"kiln_index": 3, "cost_fen": 50,  "cap_sum_fen": 50,  "lambda_value": "10/1",  "allocated_total_fen": 50,  "items": [ ... 本窑器物 ... ]}
+  ]
+}
+```
+
+上例中窑 2 装入 `p2`（体积 6）与 `p3`（体积 4），费用 200 分：
+`λ = 200 / 10 = 20`，份额恰为 120 / 80 分；窑 3 费用 50 分恰等于 `p4`
+的收费上限 50 分，份额被上限截断为 50 分。`total_allocated_fen` 恒等于
+请求的费用总额 `total_cost_fen`，各窑 `allocated_total_fen` 恒等于该窑请求费用。
+
+取整补齐示例：窑 2 费用改为 **101 分**、上限充足时 `λ = 101/10`，
+`p2` 精确份额 `303/5`（60.6 分）、`p3` 为 `202/5`（40.4 分）；
+向下取整为 60 / 40 分后余 1 分，`p2` 余数较大（并列时编号更小者优先），
+补齐后为 **61 / 40 分**，合计仍为 101 分。
+
+费用为 0 的窑 `λ = 0/1`、各件份额均为 0；收费上限为 0 的器物仅在所属窑
+费用为 0 时可行，否则该窑报上限不足。
+
+错误情况：
+
+- `400` `UNKNOWN_KILN_INDEX`：费用键含超出 `1～窑次数` 的序号，响应体列出全部非法序号；
+- `400` `MISSING_KILN_COST`：费用未完整覆盖全部窑次，响应体列出缺少的窑次序号；
+- `400` `UNKNOWN_ITEM_ID`：上限键含不属于原方案的器物编号，响应体列出全部非法编号；
+- `400` `MISSING_ITEM_CAP`：上限未完整覆盖全部器物，响应体列出缺少的器物编号；
+- `400` `KILN_CAP_INSUFFICIENT`：一个或多个窑次的费用超过该窑器物上限总和，
+  响应体逐个列出超限窑次的费用、上限总和与缺口（分）；
+- `404` `PLAN_NOT_FOUND`：方案不存在；
+- `422`：请求参数非法（费用 / 上限为负或非整数 / 器物编号为空白 / 缺少字段等）。
+
 ## 本地开发（不使用 Docker）
 
 ```bash
@@ -681,12 +767,13 @@ pip install -r requirements.txt
 KILN_DB_PATH=./kiln.db uvicorn app.main:app --reload
 ```
 
-运行求解器、温控核验与点火排程测试（无需第三方依赖，含随机用例的暴力枚举交叉验证）：
+运行求解器、温控核验、点火排程与费用分摊测试（无需第三方依赖，含随机用例的暴力枚举交叉验证）：
 
 ```bash
 python3 tests/test_solver.py
 python3 tests/test_tempcheck.py
 python3 tests/test_firing.py
+python3 tests/test_costallocation.py
 ```
 
 ## 算法说明（n ≤ 14）
@@ -780,20 +867,33 @@ n = 14 时与求解器同为万级枚举规模，典型耗时约 1～3 秒。
 
 状态数 `2^n`，`n = 14` 时典型耗时在 1 秒以内。
 
+`cost-allocation` 接口的烧成费用分摊：**各窑完全独立**。对某窑器物
+（体积 `vᵢ`、收费上限 `cᵢ`、费用 `C`），份额函数
+`S(λ) = Σ min(cᵢ, λ·vᵢ)` 是关于 `λ ≥ 0` 的单调不减连续分段线性函数，
+分段断点为各器物的阈值 `cᵢ / vᵢ`。把器物按阈值升序分组，逐段以
+「已截断器物取上限、未截断器物取 `λ·vᵢ`」推进，在 `S` 首次不低于 `C`
+的分段上做一次 `Fraction` 除法即精确定出 λ（`C` 恰为上限总和时取最高
+阈值）；`C > Σcᵢ` 时无解，返回 `KILN_CAP_INSUFFICIENT`。得到精确份额后
+各自向下取整，缺口（小于器物件数的非负整数）按「分数余数降序、编号
+升序」逐件补 1 分，故分摊总额逐窑等于请求费用。全部中间量为精确分数，
+不存在浮点误差。
+
 ## 目录结构
 
 ```
 app/
-  solver.py     # 位掩码 DP + 字典序重建（纯函数，无框架依赖）
-  tempcheck.py  # 窑温核验：分段线性 + 分数精确求最长合格时段（纯函数）
-  firing.py     # 点火排程：两轮位掩码 DP 求不逾期的最早整体完工（纯函数）
-  database.py   # SQLite 初始化与读写
-  schemas.py    # Pydantic 请求/响应模型
-  main.py       # FastAPI 路由
+  solver.py         # 位掩码 DP + 字典序重建（纯函数，无框架依赖）
+  tempcheck.py      # 窑温核验：分段线性 + 分数精确求最长合格时段（纯函数）
+  firing.py         # 点火排程：两轮位掩码 DP 求不逾期的最早整体完工（纯函数）
+  costallocation.py # 烧成费用分摊：精确有理 λ + 取整补齐（纯函数）
+  database.py       # SQLite 初始化与读写
+  schemas.py        # Pydantic 请求/响应模型
+  main.py           # FastAPI 路由
 tests/
   test_solver.py
   test_tempcheck.py
   test_firing.py
+  test_costallocation.py
 entrypoint.sh   # 安装依赖 → 初始化数据库 → 启动服务
 Dockerfile
 docker-compose.yml

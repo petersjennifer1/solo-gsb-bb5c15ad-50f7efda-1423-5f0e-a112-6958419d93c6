@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+from typing import Annotated
+
 from pydantic import BaseModel, Field, field_validator, model_validator
+
+NonNegativeFen = Annotated[int, Field(..., strict=True, ge=0)]
 
 
 class ItemIn(BaseModel):
@@ -416,3 +420,84 @@ class CancelItemsOut(BaseModel):
         ..., description="原窑次与新窑次的一对一配对，按原窑次序号升序"
     )
     new_plan: PlanOut = Field(..., description="重排后另存的新方案完整内容")
+
+
+class CostAllocationIn(BaseModel):
+    """烧成费用分摊请求：费用与收费上限均须完整覆盖原方案。"""
+
+    kiln_costs: dict[int, NonNegativeFen] = Field(
+        ...,
+        description="按窑次序号给出的烧成费用（分，非负整数），每个窑次恰好一条",
+    )
+    item_caps: dict[str, NonNegativeFen] = Field(
+        ...,
+        description="按器物编号给出的收费上限（分，非负整数），每件恰好一条",
+    )
+
+    @field_validator("item_caps")
+    @classmethod
+    def _strip_item_keys(cls, values: dict[str, int]) -> dict[str, int]:
+        cleaned: dict[str, int] = {}
+        for key, value in values.items():
+            key = key.strip()
+            if not key:
+                raise ValueError("器物编号不得为空白字符串")
+            cleaned[key] = value
+        return cleaned
+
+
+class CostItemOut(BaseModel):
+    """单件器物的费用分摊结果。"""
+
+    item_id: str = Field(..., description="器物编号")
+    kiln_index: int = Field(..., description="所属窑次序号（从 1 开始）")
+    volume: int = Field(..., description="器物体积（取自已保存方案）")
+    cap_fen: int = Field(..., description="请求的收费上限（分）")
+    exact_share_fen: str = Field(
+        ..., description="精确份额 min(上限, λ×体积)（分，约分分数 p/q）"
+    )
+    allocated_fen: int = Field(
+        ..., description="取整补齐后的实际分摊费用（分，非负整数）"
+    )
+
+
+class CostAllocationKilnOut(BaseModel):
+    """单个窑次的费用分摊结果。"""
+
+    kiln_index: int = Field(..., description="窑次序号（从 1 开始）")
+    cost_fen: int = Field(..., description="请求的该窑烧成费用（分）")
+    cap_sum_fen: int = Field(..., description="该窑器物收费上限总和（分）")
+    lambda_value: str = Field(
+        ...,
+        description=(
+            "精确比例系数 λ（分/体积，约分分数 p/q），使 "
+            "Σ min(上限, λ×体积) 恰等于该窑费用"
+        ),
+    )
+    items: list[CostItemOut] = Field(
+        ..., description="该窑各器物的分摊费用，按器物编号升序"
+    )
+    allocated_total_fen: int = Field(
+        ..., description="该窑各器物整数份额之和（等于请求的该窑费用）"
+    )
+
+
+class CostAllocationOut(BaseModel):
+    """整份方案的烧成费用分摊结果（只读计算，不改写原方案）。"""
+
+    plan_id: str = Field(..., description="原方案 ID")
+    total_cost_fen: int = Field(
+        ..., description="全部窑次烧成费用总和（分），与请求总额一致"
+    )
+    total_allocated_fen: int = Field(
+        ..., description="全部器物分摊费用总和（分），等于 total_cost_fen"
+    )
+    total_cap_sum_fen: int = Field(
+        ..., description="全部器物收费上限总和（分）"
+    )
+    items: list[CostItemOut] = Field(
+        ..., description="全部器物的分摊费用，按器物编号升序"
+    )
+    kilns: list[CostAllocationKilnOut] = Field(
+        ..., description="各窑分摊明细，按窑次序号升序"
+    )
