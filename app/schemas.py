@@ -416,3 +416,120 @@ class CancelItemsOut(BaseModel):
         ..., description="原窑次与新窑次的一对一配对，按原窑次序号升序"
     )
     new_plan: PlanOut = Field(..., description="重排后另存的新方案完整内容")
+
+
+class KilnCostIn(BaseModel):
+    """一个窑次的烧成费用。"""
+
+    kiln_index: int = Field(
+        ..., strict=True, ge=1, description="窑次序号（与方案中一致，从 1 开始）"
+    )
+    cost: int = Field(
+        ..., strict=True, ge=0, description="该窑烧成费用（分，非负整数）"
+    )
+
+
+class ItemCapIn(BaseModel):
+    """一件器物的收费上限。"""
+
+    item_id: str = Field(..., min_length=1, description="器物编号（非空字符串）")
+    cap: int = Field(
+        ..., strict=True, ge=0, description="该器物收费上限（分，非负整数）"
+    )
+
+    @field_validator("item_id")
+    @classmethod
+    def _strip_and_check(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("器物编号不得为空白字符串")
+        return v
+
+
+class CostAllocationIn(BaseModel):
+    """烧成费用分摊请求：窑次费用与器物上限都必须完整覆盖原方案。"""
+
+    kiln_costs: list[KilnCostIn] = Field(
+        ...,
+        min_length=1,
+        max_length=14,
+        description="各窑烧成费用（分，非负整数）：窑次序号须恰好覆盖方案全部窑次，不得重复",
+    )
+    item_caps: list[ItemCapIn] = Field(
+        ...,
+        min_length=1,
+        max_length=14,
+        description="各器物收费上限（分，非负整数）：编号须恰好覆盖方案全部器物，不得重复",
+    )
+
+    @model_validator(mode="after")
+    def _unique_indexes(self):
+        seen_kiln: set[int] = set()
+        dup_kiln: list[int] = []
+        for k in self.kiln_costs:
+            if k.kiln_index in seen_kiln and k.kiln_index not in dup_kiln:
+                dup_kiln.append(k.kiln_index)
+            seen_kiln.add(k.kiln_index)
+        if dup_kiln:
+            raise ValueError(
+                "窑次序号不得重复，重复序号: "
+                + ", ".join(str(i) for i in dup_kiln)
+            )
+
+        seen_item: set[str] = set()
+        dup_item: list[str] = []
+        for it in self.item_caps:
+            if it.item_id in seen_item and it.item_id not in dup_item:
+                dup_item.append(it.item_id)
+            seen_item.add(it.item_id)
+        if dup_item:
+            raise ValueError(
+                "器物编号不得重复，重复编号: " + ", ".join(dup_item)
+            )
+        return self
+
+
+class CostShareOut(BaseModel):
+    """一件器物在所属窑内的分摊费用。"""
+
+    item_id: str = Field(..., description="器物编号")
+    volume: int = Field(..., description="器物体积（取自原方案）")
+    cap: int = Field(..., description="收费上限（分，取自请求）")
+    share: int = Field(
+        ..., description="分摊费用（分，非负整数）：0 ≤ share ≤ cap"
+    )
+
+
+class KilnCostOut(BaseModel):
+    """一个窑次的分摊结果。"""
+
+    kiln_index: int = Field(..., description="窑次序号（从 1 开始）")
+    cost: int = Field(..., description="该窑烧成费用（分，取自请求）")
+    total_volume: int = Field(..., description="该窑器物体积合计（取自原方案）")
+    shares: list[CostShareOut] = Field(
+        ..., description="本窑各器物分摊费用，按器物编号升序"
+    )
+
+
+class ItemCostOut(BaseModel):
+    """一件器物的费用汇总（每件器物仅属于一个窑次）。"""
+
+    item_id: str = Field(..., description="器物编号")
+    kiln_index: int = Field(..., description="所属窑次序号")
+    share: int = Field(..., description="分摊费用（分，非负整数）")
+
+
+class CostAllocationOut(BaseModel):
+    """烧成费用分摊结果（只读计算，不改写原方案）。"""
+
+    plan_id: str = Field(..., description="原方案 ID")
+    kiln_count: int = Field(..., description="窑次数（与原方案一致）")
+    total_cost: int = Field(
+        ..., description="全部窑次费用合计（分），等于请求窑次费用之和"
+    )
+    kilns: list[KilnCostOut] = Field(
+        ..., description="各窑分摊明细，按窑次序号升序"
+    )
+    items: list[ItemCostOut] = Field(
+        ..., description="每件器物的费用汇总，按器物编号升序"
+    )

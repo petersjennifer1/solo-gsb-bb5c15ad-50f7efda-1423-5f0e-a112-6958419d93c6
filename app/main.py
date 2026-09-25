@@ -11,6 +11,7 @@ POST /plans/{plan_id}/glaze-separation   釉色隔离：提交互斥对，只读
 POST /plans/{plan_id}/kilns/{index}/temperature-check
                                            窑次温控核验：求落在合格温区内的最长连续时段
 POST /plans/{plan_id}/firing-order       单台实体窑点火排程：全部批次不逾期的最早整体完工
+POST /plans/{plan_id}/cost-allocation    烧成费用分摊：每窑按器物体积比例（受上限约束）分摊费用
 GET  /health                             健康检查
 """
 
@@ -23,6 +24,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from . import database
+from .cost_allocation import InsufficientCapError, allocate_plan_costs
 from .firing import (
     FiringBatch,
     NoFeasibleFiringOrderError,
@@ -34,6 +36,11 @@ from .schemas import (
     CancelItemsOut,
     CapacityTargetIn,
     CapacityTargetOut,
+    CostAllocationIn,
+    CostAllocationOut,
+    CostShareOut,
+    ItemCostOut,
+    KilnCostOut,
     ErrorOut,
     FiringBatchOut,
     FiringOrderIn,
@@ -99,6 +106,16 @@ def _no_feasible_firing_order_handler(
     return JSONResponse(
         status_code=400,
         content={"error": "NO_FEASIBLE_FIRING_ORDER", "message": str(exc)},
+    )
+
+
+@app.exception_handler(InsufficientCapError)
+def _insufficient_cap_handler(
+    _: Request, exc: InsufficientCapError
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=400,
+        content={"error": "INSUFFICIENT_CAP_SUM", "message": str(exc)},
     )
 
 
@@ -787,4 +804,149 @@ def firing_order(plan_id: str, payload: FiringOrderIn) -> FiringOrderOut:
         makespan_minute=schedule.makespan,
         order=[b.kiln_index for b in schedule.batches],
         batches=batches_out,
+    )
+
+
+@app.post(
+    "/plans/{plan_id}/cost-allocation",
+    response_model=CostAllocationOut,
+    tags=["plans"],
+    responses={
+        400: {
+            "model": ErrorOut,
+            "description": "窑次 / 器物未完整覆盖 / 窑费用超过该窑上限之和",
+        },
+        404: {"model": ErrorOut, "description": "方案不存在"},
+    },
+    summary="烧成费用分摊：每窑按器物体积比例（受单件上限约束）分摊费用",
+)
+def cost_allocation(plan_id: str, payload: CostAllocationIn) -> CostAllocationOut:
+    plan = database.get_plan(plan_id)
+    if plan is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": "PLAN_NOT_FOUND",
+                "message": f"未找到排程方案: {plan_id}",
+            },
+        )
+
+    kiln_count = plan["kiln_count"]
+    unknown_kilns = sorted(
+        {
+            k.kiln_index
+            for k in payload.kiln_costs
+            if not 1 <= k.kiln_index <= kiln_count
+        }
+    )
+    if unknown_kilns:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "UNKNOWN_KILN_INDEX",
+                "message": (
+                    f"方案 {plan_id} 共 {kiln_count} 个窑次，窑次序号须为 "
+                    f"1～{kiln_count}: {', '.join(str(i) for i in unknown_kilns)}"
+                ),
+            },
+        )
+    covered_kilns = {k.kiln_index for k in payload.kiln_costs}
+    missing_kilns = sorted(set(range(1, kiln_count + 1)) - covered_kilns)
+    if missing_kilns:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "MISSING_KILN_COST",
+                "message": (
+                    f"窑次费用必须恰好覆盖全部 {kiln_count} 个窑次，缺少窑次: "
+                    + ", ".join(str(i) for i in missing_kilns)
+                ),
+            },
+        )
+
+    original_ids = {it["item_id"] for it in plan["items"]}
+    unknown_items = sorted(
+        {it.item_id for it in payload.item_caps} - original_ids
+    )
+    if unknown_items:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "UNKNOWN_ITEM_ID",
+                "message": f"以下器物编号不属于原方案: {', '.join(unknown_items)}",
+            },
+        )
+    covered_items = {it.item_id for it in payload.item_caps}
+    missing_items = sorted(original_ids - covered_items)
+    if missing_items:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "MISSING_ITEM_CAP",
+                "message": (
+                    "收费上限必须覆盖原方案全部器物，缺少编号: "
+                    + ", ".join(missing_items)
+                ),
+            },
+        )
+
+    # 只读计算：以方案保存的窑次明细与器物体积为准逐窑独立分摊，
+    # 不改写原方案；某窑费用超过该窑器物上限之和时 cost_allocation
+    # 模块抛出 InsufficientCapError，由全局处理器返回 400。
+    volume_by_id = {it["item_id"]: it["volume"] for it in plan["items"]}
+    caps = {it.item_id: it.cap for it in payload.item_caps}
+    costs = {k.kiln_index: k.cost for k in payload.kiln_costs}
+    kilns_in = [
+        (
+            k["index"],
+            [(item_id, volume_by_id[item_id]) for item_id in k["item_ids"]],
+        )
+        for k in sorted(plan["kilns"], key=lambda k: k["index"])
+    ]
+
+    result = allocate_plan_costs(kilns_in, caps, costs)
+
+    kiln_index_by_item = {
+        item_id: k["index"]
+        for k in plan["kilns"]
+        for item_id in k["item_ids"]
+    }
+    item_shares = sorted(
+        (
+            share
+            for kiln in result.kilns
+            for share in kiln.shares
+        ),
+        key=lambda s: s.item_id,
+    )
+
+    return CostAllocationOut(
+        plan_id=plan["id"],
+        kiln_count=kiln_count,
+        total_cost=result.total_cost,
+        kilns=[
+            KilnCostOut(
+                kiln_index=kiln.kiln_index,
+                cost=kiln.cost,
+                total_volume=kiln.total_volume,
+                shares=[
+                    CostShareOut(
+                        item_id=s.item_id,
+                        volume=s.volume,
+                        cap=s.cap,
+                        share=s.share,
+                    )
+                    for s in kiln.shares
+                ],
+            )
+            for kiln in result.kilns
+        ],
+        items=[
+            ItemCostOut(
+                item_id=s.item_id,
+                kiln_index=kiln_index_by_item[s.item_id],
+                share=s.share,
+            )
+            for s in item_shares
+        ],
     )
